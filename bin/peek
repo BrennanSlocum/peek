@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VERSION=1.0
+VERDATE="September 23, 2026"
+
+# setup
+usage() {
+    cat <<EOF
+peek {folders} [args]
+
+-h|--help       shows usage
+-v|--version    shows version
+-a|--archive    archive files
+
+works only under ~/folders
+drive file shifting
+
+peek -a .
+moves files from drive 1 to drive 2 (archive)
+
+peek .
+moves mirror files from drive 2 back to drive 1 (temporary usage)
+
+EOF
+}
+
+ver() {
+    echo "$VERSION $VERDATE"
+}
+
+info() {
+    printf '%b\n' "$BLUE${BOLD}[INFO]$NC $1" >&2
+}
+
+warn() {
+    printf '%b\n' "$YELLOW${BOLD}[WARN]$NC $1" >&2
+}
+
+error() {
+    printf '%b\n' "$RED${BOLD}[ERR]$NC $1" >&2
+    exit 1
+}
+
+# colors
+FORMAT="\033["
+ESC="m"
+
+NC="${FORMAT}0$ESC"
+BOLD="${FORMAT}1$ESC"
+RED="${FORMAT}0;31$ESC"
+YELLOW="${FORMAT}0;33$ESC"
+# GREEN="${FORMAT}0;32$ESC"
+BLUE="${FORMAT}0;34$ESC"
+# MAGENTA="${FORMAT}0;35$ESC"
+
+# folders
+FOLDERS="$HOME/folders"
+MIRROR="/mnt/storage/folders+"
+operatingDirs=()
+
+[[ -d "$FOLDERS" ]] || error "could not find $FOLDERS"
+[[ -d "$MIRROR" ]] || error "could not find $MIRROR"
+
+# opts
+ARCHIVE_TIME=150 # in days
+
+archive=0
+
+# parse
+while (($#)); do
+    case "$1" in
+        -h|--help) usage; exit 0;;
+        -v|--version) ver; exit 0;;
+        -a|--archive) archive=1;;
+        *)
+            dir="$(realpath "$1")"
+            # needs to be in FOLDERS
+            if [[ "$dir" == "$FOLDERS" || "$dir" == "$FOLDERS/"* ]]; then
+                operatingDirs+=("$dir")
+            else
+                error "did not understand arg: $1"
+            fi
+    esac
+    shift
+done
+
+# operating dirs empty
+if [[ "${#operatingDirs[@]}" == 0 ]]; then
+    error "need atleast 1 dir"
+fi
+# BREAKS
+
+# begin
+if (( archive )); then
+# +++ archive +++
+    for dir in "${operatingDirs[@]}"; do
+        # for FILES...
+        while IFS= read -r -d '' file; do
+            # find MIRROR
+            mirrorFile="${file/$FOLDERS/$MIRROR}"
+            mirrorFileDir="$(dirname "$mirrorFile")"
+
+            [[ ! -d "$mirrorFileDir" ]] && (
+                mkdir -p "$mirrorFileDir"
+                info "made dir $mirrorFileDir"
+            )
+
+            # move MIRROR
+            rsync -av --remove-source-files "$file" "$mirrorFileDir" 1>/dev/null
+
+            # make MIRROR symlink
+            ln -sfnT "$mirrorFile" "$file"
+        done < <(find "$dir" -type f -print0 -mtime "+$ARCHIVE_TIME")
+    done
+else
+# +++ peek +++
+    # for DIRS...
+    for dir in "${operatingDirs[@]}"; do
+        # for FILES...
+        while IFS= read -r -d '' file; do
+            # find MOVE DIR
+            fileBaseDir="$(dirname "$file")"
+
+            # find MIRROR
+            mirrorFile="${file/$FOLDERS/$MIRROR}"
+            if [[ ! -f "$mirrorFile" ]]; then
+                warn "did not find mirror for $mirrorFile; archive (-a) this dir first"
+            else
+                mv -- "$mirrorFile" "$fileBaseDir" 1>/dev/null
+            fi
+        done < <(find "$dir" -type l -print0) # if FILE is SYMLINK
+    done
+fi
