@@ -1,32 +1,41 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION=1.0
-VERDATE="September 23, 2026"
+VERSION=1.4
+VERDATE="October 15, 2026"
 
 # setup
 usage() {
     cat <<EOF
-peek {folders} [args]
 
--h|--help       shows usage
--v|--version    shows version
--a|--archive    archive files
+${BOLD}usage${NC}
+    peek {folders} [args]
+    drive file shifting
+
+${BOLD}args${NC}
+    -a|--archive        archive and send to mirror folder
+    -e|--exclude <dir>  exclude a dir. works with peek|-a|-o
+    -i|--inspect <file> inspect a file (size,type,etc)
+    -o|--old            archive old files above $ARCHIVE_TIME days
+    -u|--undo           undoes previous action
+    -s|--status         overall status
+
+    -h|--help           shows usage
+    -v|--version        shows version
 
 works only under ~/folders
-drive file shifting
 
 peek -a .
-moves files from drive 1 to drive 2 (archive)
+moves files from drive 1 (CURRENT) to drive 2 (STORAGE) for archival
 
 peek .
-moves mirror files from drive 2 back to drive 1 (temporary usage)
+moves mirror files from drive 2 (STORAGE) back to drive 1 (CURRENT) for temporary usage
 
 EOF
 }
 
 ver() {
-    echo "$VERSION $VERDATE"
+    echo "peek ${BOLD}$VERSION${NC} $VERDATE"
 }
 
 info() {
@@ -42,6 +51,175 @@ error() {
     exit 1
 }
 
+prompt() {
+    printf '%b' "$MAGENTA${BOLD}[READ]$NC $1"
+}
+
+cleanupMirror() {
+    find "$MIRROR" -type d -empty -delete
+}
+
+archive() {
+    local file="$1"
+    local record="${2:-1}"
+
+    # find MIRROR
+    mirrorFile="${file/$FOLDERS/$MIRROR}"
+    mirrorFileDir="$(dirname "$mirrorFile")"
+
+    [[ ! -d "$mirrorFileDir" ]] && (
+        mkdir -p "$mirrorFileDir"
+        info "made dir $mirrorFileDir"
+    )
+
+    # move MIRROR
+    # rsync -av --remove-source-files "$file" "$mirrorFileDir" 1>/dev/null
+    mv "$file" "$mirrorFile"
+
+    # make MIRROR symlink
+    ln -sfnT "$mirrorFile" "$file"
+
+    # RECORD ACTION or not
+    if (( record )); then
+        recordAction "$file" "a"
+    fi
+    info "archived ${file##*/}"
+}
+
+peek() {
+    local file="$1"
+    local record="${2:-1}"
+    # find MOVE DIR
+
+    # find MIRROR
+    mirrorFile="${file/$FOLDERS/$MIRROR}"
+    if [[ ! -f "$mirrorFile" ]]; then
+        warn "did not find mirror for $mirrorFile; archive (-a) this dir first"
+    else
+        # move FROM archive
+        mv -- "$mirrorFile" "$file" 1>/dev/null
+
+        # RECORD ACTION or not
+        if (( record )); then
+            recordAction "$file" "p"
+        fi
+        info "peeked ${file##*/}"
+    fi
+}
+
+doesMirrorExist() {
+    if [[ -f "${1/$FOLDERS/$MIRROR}" ]]; then return 0; else return 1; fi
+}
+
+inspectFile() {
+    local inspectFile="$1"
+    local inspectFileBN="${inspectFile##*/}"
+    local inspectFileBD
+    inspectFileBD="$(stat -c%W "$inspectFile")"
+
+    local archivedStr="folders"
+    local type="${inspectFile#"$FOLDERS"/}"; type="${type%%/*}"
+    local archiveDate="-"
+
+    [[ -f "$inspectFile" ]] || warn "file $inspectFileBN does not exist"
+    inspectFile="$(realpath "$inspectFile")"
+
+    # get size
+    info "${BOLD}${inspectFileBN}$NC"
+    info "size:         $(du -h "$inspectFile" | cut -f1)"
+
+    # get location
+    if [[ "$inspectFile" == "$MIRROR"* ]]; then
+        archivedStr="folders+"
+        type="${inspectFile#"$MIRROR"/}"; type="${type%%/*}"
+
+        archiveDate="$(date -d "@${inspectFileBD}" '+%Y-%m-%d' )"
+    fi
+    info "located:      $archivedStr"
+
+    # get type
+    info "type:         $type"
+    info "archived on:  ${archiveDate}"
+
+}
+
+getStatus() {
+    #+++MAIN+++
+    info "${BOLD}MAIN${NC}"
+    info "location:     $FOLDERS"
+
+    local symlinkCount=0
+    while IFS= read -r -d '' file; do
+        if doesMirrorExist "$file"; then
+            ((++symlinkCount))
+        fi
+    done < <(find "$FOLDERS" -type l -print0 2>/dev/null || true)
+
+    info "symlinks:     $symlinkCount"
+
+    # Size of actual files on the active drive.
+    local foldersSize
+    foldersSize=$(
+        set +o pipefail
+        find "$FOLDERS" -type f -printf '%s\n' 2>/dev/null |
+            awk '{sum += $1} END {print sum + 0}'
+    )
+
+
+    info "size:         $(numfmt --to=iec "$foldersSize")"
+
+
+    #+++ARCHIVE+++
+    info "${BOLD}ARCHIVE${NC}"
+    info "location:     $MIRROR"
+
+    local mirrorSize
+    mirrorSize=$(find "$MIRROR" -type f -printf '%s\n' 2>/dev/null |
+        awk '{sum += $1} END {print sum+0}') || mirrorSize=0
+
+    info "size:         $(numfmt --to=iec "$mirrorSize")"
+
+    #+++COMPARISON+++
+    info "${BOLD}COMPARISON${NC}"
+
+    local totalSize activePct archivedPct
+
+    totalSize=$((foldersSize + mirrorSize))
+
+    if (( totalSize == 0 )); then
+        warn "could not calculate storage comparison"
+        return
+    fi
+
+    activePct=$((foldersSize * 100 / totalSize))
+    archivedPct=$((100 - activePct))
+
+    info "active:       ${activePct}%"
+    info "archived:     ${archivedPct}%"
+}
+
+recordAction() {
+    local file="$1"
+    local mode="$2"
+
+    case "$mode" in
+        a|p) printf '%s\t%s\n' "$mode" "$file" >> "$LAST_ACTION" ;;
+        *) error "did not get a or p"
+    esac
+}
+
+undo() {
+    while IFS= read -r line; do
+        part1="$(cut -d$'\t' -f1 <<< "$line")"
+        part2="$(cut -d$'\t' -f2 <<< "$line")"
+        case "$part1" in
+            a) peek "$part2" "0";;
+            p) archive "$part2" "0";;
+        esac
+    done < "$LAST_ACTION"
+    : > "$LAST_ACTION"
+}
+
 # colors
 FORMAT="\033["
 ESC="m"
@@ -52,20 +230,27 @@ RED="${FORMAT}0;31$ESC"
 YELLOW="${FORMAT}0;33$ESC"
 # GREEN="${FORMAT}0;32$ESC"
 BLUE="${FORMAT}0;34$ESC"
-# MAGENTA="${FORMAT}0;35$ESC"
+MAGENTA="${FORMAT}0;35$ESC"
 
 # folders
 FOLDERS="$HOME/folders"
 MIRROR="/mnt/storage/folders+"
+LAST_ACTION="$HOME/.config/peek.txt"
+[[ -f "$LAST_ACTION" ]] || touch "$LAST_ACTION"
 operatingDirs=()
+operatingFiles=()
+excludeDirs=()
 
 [[ -d "$FOLDERS" ]] || error "could not find $FOLDERS"
 [[ -d "$MIRROR" ]] || error "could not find $MIRROR"
 
 # opts
-ARCHIVE_TIME=150 # in days
-
+ARCHIVE_TIME=100 # in days
 archive=0
+old=0
+inspect=""
+status=0
+undo=0
 
 # parse
 while (($#)); do
@@ -73,11 +258,22 @@ while (($#)); do
         -h|--help) usage; exit 0;;
         -v|--version) ver; exit 0;;
         -a|--archive) archive=1;;
+        -o|--old) old=1;;
+        -i|--inspect) shift; inspect="$1";;
+        -s|--status) status=1;;
+        -e|--exclude) shift;
+            [[ -d "$1" ]] || error "$1 must be directory to exclude"
+            ex="${1%/}" # strip trailing slash
+            excludeDirs+=("${ex##*/}") # get basename
+            ;;
+        -u|--undo) undo=1;;
         *)
-            dir="$(realpath "$1")"
+            current="$(realpath "$(dirname "$1")")/$(basename "$1")"
             # needs to be in FOLDERS
-            if [[ "$dir" == "$FOLDERS" || "$dir" == "$FOLDERS/"* ]]; then
-                operatingDirs+=("$dir")
+            if [[ "$current" == "$FOLDERS" || "$current" == "$FOLDERS/"* ]]; then
+                operatingDirs+=("$current")
+            elif [[ -f "$current" || -L "$current" ]]; then
+                operatingFiles+=("$current")
             else
                 error "did not understand arg: $1"
             fi
@@ -85,50 +281,87 @@ while (($#)); do
     shift
 done
 
-# operating dirs empty
-if [[ "${#operatingDirs[@]}" == 0 ]]; then
-    error "need atleast 1 dir"
-fi
-# BREAKS
+# parse excludeDirs
+pruneArgs=()
+for ex in "${excludeDirs[@]}"; do
+    pruneArgs+=( -name "$ex" -type d -prune -o )
+done
 
 # begin
+if (( old )); then
+    archiveFiles=()
+    # for DIRS...
+    for dir in "${operatingDirs[@]}"; do
+        # for FILES in DIR...
+        while IFS= read -r -d '' file; do
+            info "archiving $file"
+            # construct ARRAY
+            archiveFiles+=("$file")
+        done < <(find "$dir" "${pruneArgs[@]}" -type f -mtime "+$ARCHIVE_TIME" -print0)
+    done
+
+    # add individual FILES...
+    archiveFiles+=("${operatingFiles[@]}")
+
+    # ARCHIVE ARRAY
+    prompt "archive ${#archiveFiles[@]} files? [y/N] "
+    read -r -n 1 choice
+    printf '\n'
+
+    case "$choice" in
+        Y|y)
+            for file in "${archiveFiles[@]}"; do
+                archive "$file"
+            done;;
+        N|n|*)
+            info "exiting"
+            cleanupMirror
+            exit 0;;
+    esac
+    cleanupMirror
+    exit 0
+fi
+
 if (( archive )); then
 # +++ archive +++
+    # for DIRS...
     for dir in "${operatingDirs[@]}"; do
         # for FILES...
         while IFS= read -r -d '' file; do
-            # find MIRROR
-            mirrorFile="${file/$FOLDERS/$MIRROR}"
-            mirrorFileDir="$(dirname "$mirrorFile")"
-
-            [[ ! -d "$mirrorFileDir" ]] && (
-                mkdir -p "$mirrorFileDir"
-                info "made dir $mirrorFileDir"
-            )
-
-            # move MIRROR
-            rsync -av --remove-source-files "$file" "$mirrorFileDir" 1>/dev/null
-
-            # make MIRROR symlink
-            ln -sfnT "$mirrorFile" "$file"
-        done < <(find "$dir" -type f -print0 -mtime "+$ARCHIVE_TIME")
+            archive "$file"
+        done < <(find "$dir" "${pruneArgs[@]}" -type f -print0)
     done
-else
+
+    # for INDIVIDUAL files...
+    for file in "${operatingFiles[@]}"; do
+        archive "$file"
+    done
+elif (( ! archive )); then
 # +++ peek +++
     # for DIRS...
     for dir in "${operatingDirs[@]}"; do
         # for FILES...
         while IFS= read -r -d '' file; do
-            # find MOVE DIR
-            fileBaseDir="$(dirname "$file")"
+            peek "$file"
+        done < <(find "$dir" "${pruneArgs[@]}" -type l -print0) # if FILE is SYMLINK
+    done
 
-            # find MIRROR
-            mirrorFile="${file/$FOLDERS/$MIRROR}"
-            if [[ ! -f "$mirrorFile" ]]; then
-                warn "did not find mirror for $mirrorFile; archive (-a) this dir first"
-            else
-                mv -- "$mirrorFile" "$fileBaseDir" 1>/dev/null
-            fi
-        done < <(find "$dir" -type l -print0) # if FILE is SYMLINK
+    # for INDIVIDUAL files...
+    for file in "${operatingFiles[@]}"; do
+        peek "$file"
     done
 fi
+
+if [[ "$status" -eq 1 ]]; then
+    getStatus
+fi
+
+if [[ -n "$inspect" ]]; then
+    inspectFile "$inspect"
+fi
+
+if [[ "$undo" -eq 1 ]]; then
+    undo
+fi
+
+cleanupMirror
